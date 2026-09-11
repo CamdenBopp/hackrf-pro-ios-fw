@@ -1,0 +1,13 @@
+*.bin
+*.d
+*.elf
+*.hex
+*.list
+*.map
+*.o
+*.srec
+*.dfu
+
+# build directories
+build/
+.DS_Store
