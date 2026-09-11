@@ -20,9 +20,10 @@
  */
 
 /*
- * CDC-ECM (USB ethernet gadget) interface for talking to an iPhone.
- * See usb_api_cdc.h. Link-up only for now; the ethernet data path is stubbed
- * (received frames are drained and discarded, nothing is transmitted).
+ * CDC-ECM (USB ethernet gadget) interface for talking to an iPhone. An
+ * on-device ARP/ICMP/DHCP responder brings the link up, then a UDP control and
+ * IQ transport runs over it (see handle_cmd and usb_cdc_send_iq): ASCII commands
+ * on port 5000, RX IQ streamed back from port 5001.
  */
 
 #include "usb_api_cdc.h"
@@ -33,6 +34,7 @@
 #include <libopencm3/lpc43xx/wwdt.h>
 #include <usb_queue.h>
 #include <transceiver_mode.h>
+#include <delay.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -56,6 +58,11 @@ static uint8_t cdc_notify_buf[8];
 /* IQ transmit buffer (device -> host), filled from main context by usb_cdc_send_iq. */
 static uint8_t cdc_tx_frame[ETH_FRAME_MAX];
 static volatile bool cdc_tx_busy = false;
+/* Sticky "host has stopped draining" flag. Set when a frame's drain wait times
+ * out (unplug / USB suspend / interface down) so further frames drop instantly
+ * instead of each paying the timeout; cleared by cdc_tx_complete when the host
+ * resumes and a transfer finally completes. See usb_cdc_send_iq. */
+static volatile bool cdc_tx_stalled = false;
 
 /* Control-reply transmit buffer (ARP / ICMP / DHCP / PONG), filled from the USB
  * ISR by the cdc_rx_complete handlers. Kept separate from cdc_tx_frame so a
@@ -100,6 +107,7 @@ static volatile uint32_t cdc_icmp_seen = 0;
 static volatile uint32_t cdc_ipv6_seen = 0;
 static volatile uint32_t cdc_dhcp_seen = 0;
 static volatile uint32_t cdc_tx_count = 0;
+static volatile uint32_t cdc_iq_drops = 0; /* IQ frames dropped because the host stopped draining */
 static volatile uint32_t cdc_last_len = 0;
 static uint8_t cdc_last_hdr[14];
 static uint8_t cdc_dbg[64];
@@ -121,6 +129,7 @@ static void cdc_tx_complete(void* user_data, unsigned int bytes_transferred)
 	(void) user_data;
 	(void) bytes_transferred;
 	cdc_tx_busy = false;
+	cdc_tx_stalled = false; /* host drained a frame: leave fast-drop mode */
 }
 
 /* Send the frame in cdc_tx_frame (len bytes) to the host on the bulk IN endpoint. */
@@ -317,17 +326,45 @@ bool usb_cdc_iq_active(void)
 	return iq_streaming;
 }
 
+/*
+ * Bound the wait for the previous IQ frame to drain off the bulk IN endpoint.
+ * Healthy streaming completes it in tens of microseconds; the 15-minute
+ * endurance run saw host-scheduling gaps up to ~30 ms, so 250 ms sits well clear
+ * of normal jitter. If it is still busy after that, the host has stopped
+ * draining (unplug, USB suspend, interface down): we must not spin forever or
+ * the whole RX main loop wedges and only a power cycle recovers it.
+ */
+#define CDC_TX_DRAIN_TIMEOUT_US (250000u)
+#define CDC_TX_DRAIN_POLL_US    (100u)
+
 /* Send one UDP IQ frame: 4-byte big-endian sequence number followed by len bytes
  * of IQ copied from src. The seq lets the host detect drops; it does not consume
  * IQ budget, so 16 frames of CDC_IQ_PAYLOAD carry exactly one 16 KB bulk block.
- * Spins until the previous frame has drained (the USB ISR clears cdc_tx_busy). */
+ * Drops the frame instead of spinning forever if the host has stopped draining,
+ * so the RX loop keeps running and streaming resumes when the host returns. */
 void usb_cdc_send_iq(const uint8_t* src, uint32_t len)
 {
 	if (len > CDC_IQ_PAYLOAD) {
 		len = CDC_IQ_PAYLOAD;
 	}
-	while (cdc_tx_busy) {
-		/* wait for the prior frame to finish on the wire */
+	if (cdc_tx_busy) {
+		if (cdc_tx_stalled) {
+			/* Already known-stalled: drop at once, no per-frame wait. */
+			cdc_iq_drops++;
+			return;
+		}
+		uint32_t waited_us = 0;
+		while (cdc_tx_busy && waited_us < CDC_TX_DRAIN_TIMEOUT_US) {
+			delay_us(CDC_TX_DRAIN_POLL_US);
+			waited_us += CDC_TX_DRAIN_POLL_US;
+		}
+		if (cdc_tx_busy) {
+			/* Host is not draining. Enter fast-drop and drop this frame;
+			 * cdc_tx_complete clears the flag when the host resumes. */
+			cdc_tx_stalled = true;
+			cdc_iq_drops++;
+			return;
+		}
 	}
 	uint8_t* t = cdc_tx_frame;
 	const uint32_t udp_payload = 4 + len;      /* seq + IQ */
@@ -371,6 +408,30 @@ static uint32_t parse_u64(const uint8_t* p, uint32_t len, uint64_t* out)
 		i++;
 	}
 	*out = v;
+	return i;
+}
+
+/* Parse an optionally-signed decimal at p[0..len); returns chars consumed
+ * (sign included), 0 if no digit was present so the caller can reject it. */
+static uint32_t parse_i64(const uint8_t* p, uint32_t len, int64_t* out)
+{
+	uint32_t i = 0;
+	bool neg = false;
+	if (i < len && (p[i] == '-' || p[i] == '+')) {
+		neg = (p[i] == '-');
+		i++;
+	}
+	uint64_t v = 0;
+	uint32_t digits = 0;
+	while (i < len && p[i] >= '0' && p[i] <= '9') {
+		v = v * 10 + (uint64_t)(p[i] - '0');
+		i++;
+		digits++;
+	}
+	if (digits == 0) {
+		return 0;
+	}
+	*out = neg ? -(int64_t) v : (int64_t) v;
 	return i;
 }
 
@@ -423,20 +484,51 @@ static void cdc_send_udp_reply(const uint8_t* f, uint32_t udp, const char* text)
 	cdc_send_ctl(frame_len);
 }
 
+/* Minimal decimal formatter for the STATS reply. picoprintf is only compiled
+ * into the rad1o image, and pulling it into praline just for this is overkill;
+ * these two append helpers cover everything STATS needs. Both stop short of
+ * end so the caller can always NUL-terminate. */
+static char* stats_put_str(char* p, char* const end, const char* s)
+{
+	while (*s && p < end - 1) {
+		*p++ = *s++;
+	}
+	return p;
+}
+
+static char* stats_put_u32(char* p, char* const end, uint32_t v)
+{
+	char tmp[10];
+	int n = 0;
+	do {
+		tmp[n++] = (char) ('0' + (v % 10));
+		v /= 10;
+	} while (v && n < (int) sizeof(tmp));
+	while (n > 0 && p < end - 1) {
+		*p++ = tmp[--n];
+	}
+	return p;
+}
+
 /* Protocol version reported by PONG; bump when the command set changes. */
-#define CDC_CMD_PROTOCOL "2"
+#define CDC_CMD_PROTOCOL "3"
 
 /* UDP datagram on CMD_PORT. ASCII commands, one per datagram:
  *   START           stream IQ to the sender (this MAC/IP/port)
  *   STOP            stop streaming
  *   FREQ <hz>       tune (applies live while streaming; used for voice follow)
- *   RATE <hz>       sample rate
+ *   RATE <hz>       sample rate (host-visible; the FPGA CIC decimates to it)
  *   BW <hz>         baseband filter bandwidth
  *   AMP <0|1>       RF amp
  *   LNA <db>        LNA gain (0..40, 8 dB steps)
  *   VGA <db>        VGA gain (0..62, 2 dB steps)
+ *   ANT_BIAS <0|1>  RF-port bias tee (active-antenna power; off at idle)
+ *   CORR <ppb>      reference-clock correction, signed parts-per-billion
+ *   DECIM <n|AUTO>  RX decimation: AUTO lets the firmware pick, a number sets
+ *                   manual mode with log2 ratio n (driver clamps to hardware)
  *   PING            reply "PONG <proto> <streaming>" (liveness / discovery)
- * Numbers are unsigned decimal. Unknown commands are ignored. */
+ *   STATS           reply with effective rate, decimation, and frame counters
+ * Numbers are decimal (CORR is signed). Unknown commands are ignored. */
 static void handle_cmd(const uint8_t* f, unsigned int len)
 {
 	const uint32_t ihl = (uint32_t)(f[14] & 0x0F) * 4;
@@ -454,6 +546,10 @@ static void handle_cmd(const uint8_t* f, unsigned int len)
 		memcpy(iq_host_ip, &f[26], 4);
 		iq_host_port = ((uint16_t) f[udp] << 8) | f[udp + 1];
 		iq_seq = 0;
+		/* Clear any stale drain state so a fresh stream isn't blocked by a
+		 * busy flag left set when a previous session's host stopped draining. */
+		cdc_tx_busy = false;
+		cdc_tx_stalled = false;
 		iq_streaming = true;
 		/* Kick the RX pipeline; rx_mode (main loop) will pump samples to
 		 * usb_cdc_send_iq() while usb_cdc_iq_active() is true. */
@@ -476,6 +572,47 @@ static void handle_cmd(const uint8_t* f, unsigned int len)
 		transceiver_apply_lna_gain(arg > 40 ? 40 : (uint8_t) arg);
 	} else if (cmd_is(d, dlen, "VGA") && dlen > 4 && parse_u64(&d[4], dlen - 4, &arg) > 0) {
 		transceiver_apply_vga_gain(arg > 62 ? 62 : (uint8_t) arg);
+	} else if (
+		cmd_is(d, dlen, "ANT_BIAS") && dlen > 9 &&
+		parse_u64(&d[9], dlen - 9, &arg) > 0) {
+		transceiver_apply_bias_tee(arg != 0);
+	} else if (cmd_is(d, dlen, "CORR") && dlen > 5) {
+		int64_t sarg = 0;
+		if (parse_i64(&d[5], dlen - 5, &sarg) > 0) {
+			transceiver_apply_clock_correction((int32_t) sarg);
+		}
+	} else if (cmd_is(d, dlen, "DECIM") && dlen > 6) {
+		if (d[6] == 'A' || d[6] == 'a') {
+			transceiver_apply_rx_decim(TRANSCEIVER_RX_DECIM_AUTO);
+		} else if (parse_u64(&d[6], dlen - 6, &arg) > 0) {
+			transceiver_apply_rx_decim((uint8_t) arg);
+		}
+	} else if (cmd_is(d, dlen, "STATS")) {
+		char buf[176];
+		char* const end = buf + sizeof(buf);
+		char* p = buf;
+		p = stats_put_str(p, end, "STATS proto=" CDC_CMD_PROTOCOL " stream=");
+		p = stats_put_u32(p, end, iq_streaming ? 1 : 0);
+		p = stats_put_str(p, end, " rate=");
+		p = stats_put_u32(p, end, transceiver_effective_sample_rate_hz());
+		p = stats_put_str(p, end, " decim=");
+		p = stats_put_u32(p, end, transceiver_applied_rx_decim());
+		p = stats_put_str(p, end, " mode=");
+		p = stats_put_str(p, end, transceiver_rx_decim_is_manual() ? "manual" : "auto");
+		p = stats_put_str(p, end, " rx=");
+		p = stats_put_u32(p, end, cdc_rx_count);
+		p = stats_put_str(p, end, " tx=");
+		p = stats_put_u32(p, end, cdc_tx_count);
+		p = stats_put_str(p, end, " drops=");
+		p = stats_put_u32(p, end, cdc_iq_drops);
+		p = stats_put_str(p, end, " arp=");
+		p = stats_put_u32(p, end, cdc_arp_seen);
+		p = stats_put_str(p, end, " dhcp=");
+		p = stats_put_u32(p, end, cdc_dhcp_seen);
+		p = stats_put_str(p, end, " ip6=");
+		p = stats_put_u32(p, end, cdc_ipv6_seen);
+		*p = '\0';
+		cdc_send_udp_reply(f, udp, buf);
 	}
 }
 
@@ -540,8 +677,13 @@ static void cdc_send_link_up(void)
 void usb_cdc_init(void)
 {
 	/* New configuration: nothing armed until the host activates the data
-	 * interface (alt 1). */
+	 * interface (alt 1). Clear the TX drain state so a busy flag left set by a
+	 * transfer that never completed before re-enumeration cannot block the
+	 * next stream. */
 	cdc_rx_armed = false;
+	cdc_tx_busy = false;
+	cdc_tx_stalled = false;
+	cdc_ctl_busy = false;
 }
 
 void usb_cdc_set_interface(

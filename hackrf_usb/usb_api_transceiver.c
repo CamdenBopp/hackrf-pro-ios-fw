@@ -214,6 +214,61 @@ void transceiver_apply_vga_gain(uint8_t gain_db)
 	radio_reg_write(&radio, RADIO_BANK_REQUESTED, RADIO_GAIN_RX_BB, gain_db);
 }
 
+void transceiver_apply_bias_tee(bool enable)
+{
+	radio_reg_write(&radio, RADIO_BANK_REQUESTED, RADIO_BIAS_TEE, enable ? 1 : 0);
+}
+
+void transceiver_apply_clock_correction(int32_t ppb)
+{
+	/*
+	 * RADIO_CLOCK_CORRECTION is an fp_1_63 factor where FRAC_ONE (1<<63) is
+	 * 1.0. FRAC_ONE does not fit in a signed 64-bit int, so form the (signed,
+	 * small) offset first and fold it in with unsigned arithmetic. The radio
+	 * driver clamps the factor to +/-1% and falls back to nominal outside that.
+	 *
+	 * Clamp ppb just past that window (1% == 10,000,000 ppb) first: in-range
+	 * values map exactly, larger ones stay out-of-range so the driver nulls
+	 * them, and the int64 multiply below cannot overflow.
+	 */
+	const int32_t ppb_limit = 11000000;
+	if (ppb > ppb_limit) {
+		ppb = ppb_limit;
+	} else if (ppb < -ppb_limit) {
+		ppb = -ppb_limit;
+	}
+	const int64_t delta = (int64_t) ppb * (int64_t) FRAC_ONE_PPB;
+	const uint64_t correction = FRAC_ONE + (uint64_t) delta;
+	radio_reg_write(&radio, RADIO_BANK_REQUESTED, RADIO_CLOCK_CORRECTION, correction);
+}
+
+void transceiver_apply_rx_decim(uint8_t log2_ratio)
+{
+	const uint64_t value =
+		(log2_ratio == TRANSCEIVER_RX_DECIM_AUTO) ? RADIO_UNSET : log2_ratio;
+	radio_reg_write(&radio, RADIO_BANK_REQUESTED, RADIO_RESAMPLE_RX, value);
+}
+
+uint32_t transceiver_effective_sample_rate_hz(void)
+{
+	const uint64_t rate = radio_reg_read(&radio, RADIO_BANK_APPLIED, RADIO_SAMPLE_RATE);
+	if (rate == RADIO_UNSET) {
+		return 0;
+	}
+	return (uint32_t) (rate >> 36); /* fp_28_36 (1/2**36 Hz) -> Hz */
+}
+
+uint8_t transceiver_applied_rx_decim(void)
+{
+	const uint64_t n = radio_reg_read(&radio, RADIO_BANK_APPLIED, RADIO_RESAMPLE_RX);
+	return (n == RADIO_UNSET) ? 0xff : (uint8_t) n;
+}
+
+bool transceiver_rx_decim_is_manual(void)
+{
+	return radio_reg_read(&radio, RADIO_BANK_REQUESTED, RADIO_RESAMPLE_RX) != RADIO_UNSET;
+}
+
 usb_request_status_t usb_vendor_request_set_sample_rate_frac(
 	usb_endpoint_t* const endpoint,
 	const usb_transfer_stage_t stage)

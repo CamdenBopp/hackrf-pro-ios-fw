@@ -50,6 +50,26 @@ void transceiver_apply_amp(bool enable);
 void transceiver_apply_lna_gain(uint8_t gain_db);
 void transceiver_apply_vga_gain(uint8_t gain_db);
 
+/* RF port bias tee (active antenna / external LNA power). Follows the stock
+ * auto-off-at-idle behavior: on during RX, off when streaming stops. */
+void transceiver_apply_bias_tee(bool enable);
+
+/* Reference-clock correction in parts per billion (signed). The driver clamps
+ * the resulting factor to +/-1%. Zero restores the nominal clock. */
+void transceiver_apply_clock_correction(int32_t ppb);
+
+/* RX decimation control. TRANSCEIVER_RX_DECIM_AUTO hands the ratio back to the
+ * firmware's auto-pick (highest ratio the AFE allows); any other value selects
+ * manual mode with that log2 ratio (driver clamps to the gateware's range). */
+#define TRANSCEIVER_RX_DECIM_AUTO (0xff)
+void transceiver_apply_rx_decim(uint8_t log2_ratio);
+
+/* STATS accessors: the applied (effective) values after the driver has clamped
+ * and quantized a request. Effective rate is 0 until a rate has been applied. */
+uint32_t transceiver_effective_sample_rate_hz(void);
+uint8_t transceiver_applied_rx_decim(void); /* log2 ratio, or 0xff if unset */
+bool transceiver_rx_decim_is_manual(void);
+
 usb_request_status_t usb_vendor_request_set_transceiver_mode(
 	usb_endpoint_t* const endpoint,
 	const usb_transfer_stage_t stage);

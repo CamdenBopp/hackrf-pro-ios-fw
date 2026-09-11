@@ -28,11 +28,20 @@ personality next to it.
   to bring the link up and hand the host an address on a private `10.55.0.0/24`.
   The DHCP reply deliberately omits a gateway so the phone does not route its
   internet traffic through the radio.
-- A UDP control and IQ transport on that link. The app sends ASCII commands to
-  UDP port 5000 (`START`, `STOP`, `FREQ <hz>`, `RATE <hz>`, `BW <hz>`,
-  `AMP <0|1>`, `LNA <db>`, `VGA <db>`, `PING`); RX IQ streams back from port
-  5001 as `[4-byte big-endian sequence][1024 bytes signed 8-bit IQ]`. `FREQ`
-  applies mid-stream, which is what makes voice-follow retuning possible.
+- A UDP control and IQ transport on that link (protocol version 3). The app
+  sends ASCII commands to UDP port 5000; RX IQ streams back from port 5001 as
+  `[4-byte big-endian sequence][1024 bytes signed 8-bit IQ]`. The commands are
+  `START`, `STOP`, `FREQ <hz>`, `RATE <hz>`, `BW <hz>`, `AMP <0|1>`,
+  `LNA <db>`, `VGA <db>`, `ANT_BIAS <0|1>` (RF-port bias tee, off at idle),
+  `CORR <ppb>` (signed reference-clock correction in parts per billion),
+  `DECIM <n|AUTO>` (RX decimation: `AUTO` lets the firmware pick, a number sets
+  a manual log2 ratio), `PING`, and `STATS`. `FREQ` applies mid-stream, which is
+  what makes voice-follow retuning possible. On praline a low `RATE` engages the
+  FPGA CIC decimator automatically, so the streamed rate is the requested rate.
+  `STATS` replies with the effective rate, decimation, and frame counters.
+- If the host stops draining the link mid-stream (unplug, USB suspend, interface
+  down), the radio drops IQ frames rather than blocking, and streaming resumes on
+  its own when the host returns. Dropped frames are counted in `STATS`.
 - A vendor request to toggle the ethernet personality on or off, persisted in
   no-init RAM across a reset. A desktop that wants the plain vendor interface
   can turn it off; unplugging and powering down defaults it back on, so a phone
